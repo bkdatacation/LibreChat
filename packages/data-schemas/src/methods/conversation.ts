@@ -53,9 +53,11 @@ import { isAgentFadingTier, isAgentFadingTierEntries } from '~/utils/fading';
 import { isCompactionSemanticIndexProjection } from '~/types/compaction';
 import { withoutMeiliIndexing } from '~/models/plugins/mongoMeili';
 import { prepareSubagentContentDeletion } from './subagentContent';
+import { createStoredResponseModel } from '~/models/response';
 import { tenantSafeBulkWrite } from '~/utils/tenantBulkWrite';
 import { isValidObjectIdString } from '~/utils/objectId';
 import { decrementTagCounts } from './conversationTag';
+import { closeResponseScopes } from './responseScope';
 import logger from '~/config/winston';
 
 const ACTOR_CHECKPOINT_FIELDS = [
@@ -4046,12 +4048,35 @@ export function createConversationMethods(
         .select('conversationId tenantId chatProjectId tags')
         .lean<DeletionConversation[]>();
       const recoveryConversationIds: string[] = [];
+      const responses = createStoredResponseModel(mongoose);
+      const recoveryResponseScopes: DeletionConversation[] = [];
+      const responseGroups = (wave: DeletionConversation[]) => {
+        const groups = new Map<string | undefined, string[]>();
+        for (const conversation of wave) {
+          const ids = groups.get(conversation.tenantId) ?? [];
+          ids.push(conversation.conversationId);
+          groups.set(conversation.tenantId, ids);
+        }
+        return groups;
+      };
+      const closeResponses = async (wave: DeletionConversation[]) => {
+        for (const [tenantId, ids] of responseGroups(wave))
+          await closeResponseScopes(mongoose, { userId: user, tenantId }, ids);
+      };
+      const eraseResponses = async (wave: DeletionConversation[]) => {
+        for (const [tenantId, ids] of responseGroups(wave))
+          await responses.deleteMany({
+            userId: user,
+            tenantId: tenantId ?? null,
+            conversationId: { $in: ids },
+          });
+      };
       if (!conversations.length && typeof filter.conversationId === 'string') {
         /** A prior attempt may have deleted the root before a descendant read failed.
          * Resume from immutable root lineage and retain the root id for message,
          * checkpoint, and tool cleanup. The message probe distinguishes that partial
          * commit from a conversation id that never existed. */
-        const [descendants, rootMessages] = await Promise.all([
+        const [descendants, rootMessages, responseTenants, tenantlessResponse] = await Promise.all([
           retryCascadeOperation(() =>
             Conversation.find({
               user,
@@ -4061,8 +4086,21 @@ export function createConversationMethods(
               .lean<DeletionConversation[]>(),
           ),
           getMessages({ user, conversationId: filter.conversationId }, '_id', { limit: 1 }),
+          responses.distinct('tenantId', { userId: user, conversationId: filter.conversationId }),
+          responses.exists({ userId: user, tenantId: null, conversationId: filter.conversationId }),
         ]);
-        if (descendants.length === 0 && rootMessages.length === 0 && options?.allowEmpty !== true) {
+        for (const tenantId of responseTenants) {
+          if (typeof tenantId === 'string')
+            recoveryResponseScopes.push({ conversationId: filter.conversationId, tenantId });
+        }
+        if (tenantlessResponse)
+          recoveryResponseScopes.push({ conversationId: filter.conversationId });
+        if (
+          descendants.length === 0 &&
+          rootMessages.length === 0 &&
+          recoveryResponseScopes.length === 0 &&
+          options?.allowEmpty !== true
+        ) {
           throw new Error('Conversation not found or already deleted.');
         }
         conversations = descendants;
@@ -4132,6 +4170,7 @@ export function createConversationMethods(
           break;
         }
         const waveIds = wave.map((conversation) => conversation.conversationId);
+        await closeResponses(wave);
         await deps?.deleteAgentQueuedTurns?.(
           user,
           wave.map((conversation) => ({
@@ -4147,6 +4186,8 @@ export function createConversationMethods(
             conversationId: { $in: waveIds },
           }),
         );
+        // Like subagent content, response erasure is an irreversible part of deletion intent.
+        await eraseResponses(wave);
         const result = await Conversation.deleteMany({ user, conversationId: { $in: waveIds } });
         if (result.deletedCount > 0) {
           /** Result erasure is irreversible. Keep receipts intact when a
@@ -4181,6 +4222,8 @@ export function createConversationMethods(
       ];
 
       if (recoveryConversationIds.length > 0) {
+        await closeResponses(recoveryResponseScopes);
+        await eraseResponses(recoveryResponseScopes);
         await deps?.deleteAgentQueuedTurns?.(
           user,
           recoveryConversationIds.map((conversationId) => ({
